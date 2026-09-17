@@ -16,6 +16,45 @@ st.set_page_config(page_title="AstraBurn AI — Semiconductor Screening", page_i
 st.markdown("## 🛰️ AstraBurn AI — Autonomous Semiconductor Screening System")
 st.caption("Mission-Critical Latent Defect Identification & Reliability Intelligence Platform")
 
+# --- FUNCTION TO CREATE DEFAULT SYNTHETIC DATASET ---
+def generate_default_data():
+    np.random.seed(42)
+    grid_size = 13
+    radius = grid_size // 2
+    records = []
+    comp_counter = 1
+    for x in range(-radius, radius + 1):
+        for y in range(-radius, radius + 1):
+            dist = np.sqrt(x**2 + y**2)
+            if dist <= radius:
+                base_leakage = np.random.normal(10.0, 1.2)
+                v_th = np.random.normal(1.8, 0.05)
+                v_br = np.random.normal(32.0, 1.1)
+                is_edge = dist > (radius - 1.5)
+                thermal_drift = np.random.normal(0.4, 0.15)
+                if is_edge and np.random.rand() > 0.65:
+                    base_leakage += np.random.uniform(25.0, 36.0)
+                    v_th -= np.random.uniform(0.3, 0.5)
+                    v_br -= np.random.uniform(5.0, 8.0)
+                    thermal_drift += np.random.uniform(8.0, 18.0)
+                records.append({
+                    'Component_ID': f"W01_D{comp_counter:03d}",
+                    'Lot_ID': 'Lot_L10',
+                    'Wafer_X': x,
+                    'Wafer_Y': y,
+                    'Pre_BurnIn_uA': round(float(base_leakage), 2),
+                    'Post_BurnIn_uA': round(float(base_leakage + thermal_drift), 2),
+                    'Vth_Volts': round(float(v_th), 3),
+                    'Vbr_Volts': round(float(v_br), 2)
+                })
+                comp_counter += 1
+    return pd.DataFrame(records)
+
+# --- SESSION STATE INITIALIZATION ---
+if 'dataset' not in st.session_state:
+    st.session_state.dataset = generate_default_data()
+    st.session_state.is_custom_uploaded = False
+
 # --- SIDEBAR: CONTROLS ---
 st.sidebar.title("🎛️ Mission Configuration")
 menu = st.sidebar.radio("Navigation", [
@@ -62,60 +101,39 @@ user_static_limit = st.sidebar.number_input(
     step=1.0
 )
 
-# --- SYNTHETIC DATASET GENERATOR ---
-if 'dataset' not in st.session_state:
-    np.random.seed(42)
-    grid_size = 13
-    radius = grid_size // 2
-    records = []
-    comp_counter = 1
-    for x in range(-radius, radius + 1):
-        for y in range(-radius, radius + 1):
-            dist = np.sqrt(x**2 + y**2)
-            if dist <= radius:
-                base_leakage = np.random.normal(10.0, 1.2)
-                v_th = np.random.normal(1.8, 0.05)
-                v_br = np.random.normal(32.0, 1.1)
-                is_edge = dist > (radius - 1.5)
-                thermal_drift = np.random.normal(0.4, 0.15)
-                if is_edge and np.random.rand() > 0.65:
-                    base_leakage += np.random.uniform(25.0, 36.0)
-                    v_th -= np.random.uniform(0.3, 0.5)
-                    v_br -= np.random.uniform(5.0, 8.0)
-                    thermal_drift += np.random.uniform(8.0, 18.0)
-                records.append({
-                    'Component_ID': f"W01_D{comp_counter:03d}",
-                    'Lot_ID': 'Lot_L10',
-                    'Wafer_X': x,
-                    'Wafer_Y': y,
-                    'Pre_BurnIn_uA': round(float(base_leakage), 2),
-                    'Post_BurnIn_uA': round(float(base_leakage + thermal_drift), 2),
-                    'Vth_Volts': round(float(v_th), 3),
-                    'Vbr_Volts': round(float(v_br), 2)
-                })
-                comp_counter += 1
-    st.session_state.dataset = pd.DataFrame(records)
+if st.sidebar.button("🔄 Reset to Default Wafer Lot"):
+    st.session_state.dataset = generate_default_data()
+    st.session_state.is_custom_uploaded = False
+    st.rerun()
 
-df = st.session_state.dataset
+if st.session_state.get('is_custom_uploaded', False):
+    st.sidebar.success("📂 Using Custom Uploaded Lot")
 
 # --- CORE SCREENING ENGINE ---
 def process_data(data, static_limit, z_thresh):
     d = data.copy()
+    if 'Lot_ID' not in d.columns:
+        d['Lot_ID'] = 'Lot_Uploaded'
+    
     d['Lot_Mean'] = d.groupby('Lot_ID')['Pre_BurnIn_uA'].transform('mean')
-    d['Lot_Std'] = d.groupby('Lot_ID')['Pre_BurnIn_uA'].transform('std').replace(0, 0.001)
+    d['Lot_Std'] = d.groupby('Lot_ID')['Pre_BurnIn_uA'].transform('std').replace(0, 0.001).fillna(0.001)
     d['Z_Score'] = (d['Pre_BurnIn_uA'] - d['Lot_Mean']) / d['Lot_Std']
     d['Static_Status'] = np.where(d['Pre_BurnIn_uA'] <= static_limit, 'PASS', 'FAIL')
     d['AstraBurn_Anomaly'] = d['Z_Score'].abs() > z_thresh
     d['Defect_Category'] = 'Flight Qualified'
     d.loc[d['Static_Status'] == 'FAIL', 'Defect_Category'] = 'Catastrophic Fail'
     d.loc[(d['Static_Status'] == 'PASS') & (d['AstraBurn_Anomaly']), 'Defect_Category'] = 'Latent Defect (Outlier)'
+    
+    if 'Post_BurnIn_uA' not in d.columns:
+        d['Post_BurnIn_uA'] = d['Pre_BurnIn_uA'] + 0.3
+    
     d['Drift_uA'] = d['Post_BurnIn_uA'] - d['Pre_BurnIn_uA']
-    d['Drift_Percent'] = (d['Drift_uA'] / d['Pre_BurnIn_uA']) * 100
+    d['Drift_Percent'] = (d['Drift_uA'] / d['Pre_BurnIn_uA'].replace(0, 0.001)) * 100
     z_abs = d['Z_Score'].abs()
     d['Risk_Probability'] = np.clip((z_abs / 4.0) * 60 + (d['Drift_Percent'] / 50.0) * 40, 5, 99)
     return d
 
-processed_df = process_data(df, user_static_limit, user_z_threshold)
+processed_df = process_data(st.session_state.dataset, user_static_limit, user_z_threshold)
 
 # --- PDF GENERATOR ---
 def generate_pdf_report(dataframe, mission, static_lim, z_cut):
@@ -132,7 +150,7 @@ def generate_pdf_report(dataframe, mission, static_lim, z_cut):
     static_bad = (dataframe['Static_Status'] == 'FAIL').sum()
     latent_bad = (dataframe['Defect_Category'] == 'Latent Defect (Outlier)').sum()
     accepted = total_parts - static_bad - latent_bad
-    yield_val = (accepted / total_parts) * 100
+    yield_val = (accepted / total_parts) * 100 if total_parts > 0 else 0
     status_stamp = "FLIGHT QUALIFIED" if latent_bad == 0 and static_bad == 0 else "BATCH QUARANTINE / REJECT"
     summary_data = [
         ['Parameter', 'Specification / Test Result'],
@@ -170,11 +188,11 @@ if menu == "📊 Officer Executive Dashboard":
     total = len(processed_df)
     static_fails = (processed_df['Static_Status'] == 'FAIL').sum()
     latent_defects = (processed_df['Defect_Category'] == 'Latent Defect (Outlier)').sum()
-    yield_rate = ((total - static_fails - latent_defects) / total) * 100
+    yield_rate = ((total - static_fails - latent_defects) / total) * 100 if total > 0 else 0
     
     m1.metric("Total Tested", f"{total}")
     m2.metric(f"Static Fails (>{user_static_limit}µA)", f"{static_fails}")
-    m3.metric(f"Latent Defects (|Z|>{user_z_threshold:.1f})", f"{latent_defects}", delta="High Risk", delta_color="inverse")
+    m3.metric(f"Latent Defects (|Z|>{user_z_threshold:.1f})", f"{latent_defects}", delta="High Risk" if latent_defects > 0 else "Nominal", delta_color="inverse")
     m4.metric("Flight Qualified Yield", f"{yield_rate:.1f}%")
     
     st.markdown("---")
@@ -202,7 +220,7 @@ if menu == "📊 Officer Executive Dashboard":
             use_container_width=True
         )
 
-# --- 2. DUAL-BIN HARDWARE INSPECTOR (NEW REQUESTED FEATURE) ---
+# --- 2. DUAL-BIN HARDWARE INSPECTOR ---
 elif menu == "📦 Dual-Bin Hardware Inspector":
     st.subheader("Physical Hardware Binning & Interactive Defect Inspector")
     st.caption("Segregated cleanroom sorting bins: Flight-Approved Hardware vs Quarantined Outliers")
@@ -236,14 +254,13 @@ elif menu == "📦 Dual-Bin Hardware Inspector":
     
     st.markdown("---")
     st.subheader("🔍 Interactive Defect Reason Inspector")
-    st.markdown("Select or touch any defective component from **Bin B** to view exact root-cause failure analysis:")
+    st.markdown("Select any defective component from **Bin B** to view exact root-cause failure analysis:")
     
     if len(defect_hardware) > 0:
         defect_ids = list(defect_hardware['Component_ID'])
         selected_defect_id = st.selectbox("Select Quarantined Component ID to Inspect:", defect_ids)
         target = defect_hardware[defect_hardware['Component_ID'] == selected_defect_id].iloc[0]
         
-        # Diagnostic Audit Card
         card_col1, card_col2, card_col3, card_col4 = st.columns(4)
         card_col1.metric("Component ID", target['Component_ID'])
         card_col2.metric("Pre-Burn Leakage", f"{target['Pre_BurnIn_uA']} µA")
@@ -279,7 +296,8 @@ elif menu == "⚡ Real-Time Burn-In Chamber Sim":
     progress_bar = st.progress(0)
     
     if start_sim:
-        sim_df = processed_df.sample(15, random_state=42).copy()
+        sample_size = min(15, len(processed_df)) if len(processed_df) > 0 else 1
+        sim_df = processed_df.sample(sample_size, random_state=42).copy()
         for step in range(1, 101):
             temp = 25 + (step / 100.0) * 100.0
             chamber_temp.metric("Chamber Core Temp", f"{temp:.1f} °C")
@@ -412,46 +430,77 @@ elif menu == "🚨 Live Audio Alerts & Quarantine Hub":
     st.markdown("---")
     st.dataframe(latent_defects_df[['Component_ID', 'Lot_ID', 'Wafer_X', 'Wafer_Y', 'Pre_BurnIn_uA', 'Z_Score', 'Risk_Probability']], use_container_width=True)
 
-# --- 8. DATA INGESTION ---
+# --- 8. DATA INGESTION (PERSISTENT STATE FIX) ---
 elif menu == "📥 Data Ingestion (Upload / Manual)":
-    st.subheader("Data Management")
+    st.subheader("Data Management & Dynamic Batch Ingestion")
+    
+    if st.session_state.get('is_custom_uploaded', False):
+        st.info(f"Currently active custom batch has **{len(st.session_state.dataset)} components** loaded.")
+    
     t1, t2 = st.tabs(["Upload CSV/Excel", "Manual Entry"])
     with t1:
-        up_file = st.file_uploader("Choose screening file", type=['csv', 'xlsx'])
-        if up_file:
+        up_file = st.file_uploader("Upload screening file (.csv, .xlsx)", type=['csv', 'xlsx'])
+        if up_file is not None:
             up_df = pd.read_csv(up_file) if up_file.name.endswith('.csv') else pd.read_excel(up_file)
-            st.dataframe(up_df.head(5))
+            st.write("Preview of Uploaded File:")
+            st.dataframe(up_df.head(5), use_container_width=True)
+            
             cols = list(up_df.columns)
-            id_guess = next((c for c in cols if 'comp' in c.lower() or 'id' in c.lower()), cols[0])
-            lot_guess = next((c for c in cols if 'lot' in c.lower()), cols[0])
-            leak_guess = next((c for c in cols if 'pre' in c.lower() or 'leak' in c.lower() or 'current' in c.lower()), cols[-1])
-            c_id = st.selectbox("Component ID Column", cols, index=cols.index(id_guess))
-            c_lot = st.selectbox("Lot ID Column", cols, index=cols.index(lot_guess))
-            c_val = st.selectbox("Leakage Current Column", cols, index=cols.index(leak_guess))
-            if st.button("Load Data"):
+            id_guess = next((c for c in cols if 'comp' in c.lower() or 'id' in c.lower() or 'chip' in c.lower()), cols[0])
+            lot_guess = next((c for c in cols if 'lot' in c.lower() or 'batch' in c.lower()), cols[0])
+            leak_guess = next((c for c in cols if 'pre' in c.lower() or 'leak' in c.lower() or 'current' in c.lower() or 'ua' in c.lower()), cols[-1])
+            
+            col_m1, col_m2, col_m3 = st.columns(3)
+            c_id = col_m1.selectbox("Component ID Column:", cols, index=cols.index(id_guess))
+            c_lot = col_m2.selectbox("Lot ID Column:", cols, index=cols.index(lot_guess))
+            c_val = col_m3.selectbox("Pre-Burn Leakage Column:", cols, index=cols.index(leak_guess))
+            
+            if st.button("🚀 Ingest & Apply to All AstraBurn Features"):
                 clean_pre = pd.to_numeric(up_df[c_val], errors='coerce').fillna(0.0)
-                st.session_state.dataset = pd.DataFrame({
+                n = len(up_df)
+                
+                # Check for existing wafer / post columns, otherwise auto-populate
+                x_coords = up_df['Wafer_X'] if 'Wafer_X' in up_df.columns else np.random.randint(-6, 7, n)
+                y_coords = up_df['Wafer_Y'] if 'Wafer_Y' in up_df.columns else np.random.randint(-6, 7, n)
+                post_vals = pd.to_numeric(up_df['Post_BurnIn_uA'], errors='coerce') if 'Post_BurnIn_uA' in up_df.columns else (clean_pre + np.random.normal(0.4, 0.2, n))
+                
+                new_dataset = pd.DataFrame({
                     'Component_ID': up_df[c_id].astype(str),
                     'Lot_ID': up_df[c_lot].astype(str) if c_lot != c_id else 'Uploaded_Lot',
-                    'Wafer_X': np.random.randint(-6, 7, len(up_df)),
-                    'Wafer_Y': np.random.randint(-6, 7, len(up_df)),
+                    'Wafer_X': x_coords,
+                    'Wafer_Y': y_coords,
                     'Pre_BurnIn_uA': clean_pre,
-                    'Post_BurnIn_uA': clean_pre + 0.3,
+                    'Post_BurnIn_uA': post_vals.round(2),
                     'Vth_Volts': 1.8,
                     'Vbr_Volts': 32.0
                 })
-                st.success("Loaded successfully!")
+                
+                # Update persistent state
+                st.session_state.dataset = new_dataset
+                st.session_state.is_custom_uploaded = True
+                st.success(f"✅ Successfully loaded {n} components! Go to any tab (Dashboard, Dual-Bin, etc.) to see results.")
                 st.rerun()
+
     with t2:
-        with st.form("manual"):
-            cid = st.text_input("Component ID", f"COMP_{len(df)+1:03d}")
-            lid = st.selectbox("Lot ID", ["Lot_L10", "Lot_L11", "Lot_L12"])
-            pre = st.number_input("Leakage Current (µA)", value=10.5)
-            post = st.number_input("Post Burn Leakage (µA)", value=11.0)
-            if st.form_submit_button("Add Component"):
-                new_data = pd.DataFrame([{'Component_ID': cid, 'Lot_ID': lid, 'Wafer_X': 0, 'Wafer_Y': 0, 'Pre_BurnIn_uA': pre, 'Post_BurnIn_uA': post, 'Vth_Volts': 1.8, 'Vbr_Volts': 32.0}])
-                st.session_state.dataset = pd.concat([st.session_state.dataset, new_data], ignore_index=True)
-                st.success("Component Added!")
+        with st.form("manual_entry_form"):
+            st.write("Add individual component manually to current batch:")
+            cid = st.text_input("Component ID", f"COMP_{len(st.session_state.dataset)+1:03d}")
+            lid = st.selectbox("Lot ID", ["Lot_L10", "Lot_L11", "Lot_Custom"])
+            pre = st.number_input("Pre-Burn Leakage Current (µA)", value=12.5)
+            post = st.number_input("Post-Burn Leakage Current (µA)", value=13.0)
+            if st.form_submit_button("Add to Batch"):
+                new_entry = pd.DataFrame([{
+                    'Component_ID': cid, 
+                    'Lot_ID': lid, 
+                    'Wafer_X': np.random.randint(-5, 6), 
+                    'Wafer_Y': np.random.randint(-5, 6), 
+                    'Pre_BurnIn_uA': pre, 
+                    'Post_BurnIn_uA': post, 
+                    'Vth_Volts': 1.8, 
+                    'Vbr_Volts': 32.0
+                }])
+                st.session_state.dataset = pd.concat([st.session_state.dataset, new_entry], ignore_index=True)
+                st.success("Component appended to batch!")
                 st.rerun()
 
 # --- 9. LOT VARIATION ---
